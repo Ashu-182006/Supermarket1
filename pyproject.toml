@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "supermarket-nav"
+version = "1.0.0"
+description = "Grid-world supermarket RL environment for LLM agent evaluation"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.29.0",
+    "pydantic>=2.0.0",
+    "numpy>=1.26.0",
+    "requests>=2.31.0",
+    "openai>=1.30.0",
+    "openenv-core>=0.2.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "httpx"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["supermart_env*"]
+
+[project.scripts]
+server = "server.app:main"
