@@ -1,197 +1,225 @@
-# Hackathon Submission Fix Guide
+from __future__ import annotations
+import subprocess
+import time
+import argparse
+import os
+import re
+import sys
+from typing import Any, Dict, Optional
 
-## Issue Summary
-Your Phase 2 submission is failing at **Task Validation** with the error:
-> "Not enough tasks with graders · One or more task scores are out of range"
+import requests
+from openai import OpenAI
 
-This is a **dual error** that indicates:
-1. The graders are properly configured (you have 3 tasks) ✅
-2. BUT task scores are being clamped incorrectly ⚠️
 
-## Root Cause Analysis
+DEFAULT_BASE_URL = "http://localhost:7860"
+ACTION_NAMES = ["UP", "DOWN", "LEFT", "RIGHT", "COLLECT"]
+ACTION_NAME_TO_ID = {name: idx for idx, name in enumerate(ACTION_NAMES)}
 
-### The Problem
-The error message "scores out of range" means the submission evaluator is receiving task scores that are **exactly 0.0 or exactly 1.0**, which violates the constraint: **"Each task's score must be strictly between 0 and 1 (not 0.0 and not 1.0)"**
+SYSTEM_PROMPT = """You are an expert shopping agent navigating a grid supermarket.
+GRID LAYOUT (8 rows x 7 cols):
+  - Spawn:    row 0, col 3
+  - Counter:  row 7, col 3  (EXIT -- go here after collecting all items)
+  - Aisles:   A1(1,1) A2(3,1) A3(5,1) A4(1,5) A5(3,5) A6(5,5)
+ACTIONS (reply with EXACTLY the action name -- nothing else):
+  UP      move one row up    (row - 1)
+  DOWN    move one row down  (row + 1)
+  LEFT    move one col left  (col - 1)
+  RIGHT   move one col right (col + 1)
+  COLLECT pick up item at current aisle (only when standing on an aisle that has a target)
+RULES:
+  1. In Phase 0: navigate to each target aisle and COLLECT all required items.
+  2. In Phase 1: return to the Counter at (7, 3) to complete the task.
+  3. COLLECT is only valid when action_mask[4] is true (you are on a target aisle).
+  4. On HARD level you MUST collect the CLOSEST item first.
+  5. Every step costs reward; reach the counter as fast as possible.
+Reply with ONE word -- the action name. No explanation, no punctuation."""
 
-This can happen if:
-- Episodes complete with 0.0 raw reward (complete failure)
-- Episodes complete with perfect reward equal to max_reward (perfect success)
-- The `clamp` parameter in graders processes data incorrectly
-- The `normalised_score()` method returns boundary values in edge cases
 
-### Current Implementation Review
+def build_user_message(state: Dict[str, Any]) -> str:
+    mask_str = ", ".join(
+        f"{name}={'OK' if ok else 'BLOCKED'}"
+        for name, ok in zip(ACTION_NAMES, state["action_mask"])
+    )
+    lines = [
+        f"Position : {state['agent_pos']}",
+        f"Phase    : {state['phase']} ({state['phase_label']})",
+        f"Targets  : {state['targets']}",
+        f"Inventory: {state['inventory']}",
+        f"Remaining: {[t for t in state['targets'] if t not in state['inventory']]}",
+        f"Closest  : {state['closest_target']}",
+        f"Steps    : {state['steps_taken']} / {state['steps_taken'] + state['steps_remaining']}",
+        f"Total rwd: {state['total_reward']:.2f}",
+        f"Masks    : {mask_str}",
+        f"Last evt : {state.get('event', '')}",
+    ]
+    return "\n".join(lines)
 
-Your `supermart_env.py` has this implementation (line 248-251):
-```python
-def normalised_score(self) -> float:
-    raw = max(0.0, self._total_reward)
-    score = round(min(raw / self._max_reward, 1.0), 6) if self._max_reward > 0 else 0.0
-    return max(0.001, min(0.999, score))  # ✅ Already clamped!
-```
 
-Your `inference.py` also clamps (line 200-202):
-```python
-raw_score = state.get("normalised_score", 0.0)
-return max(0.001, min(0.999, raw_score))  # ✅ Double safety clamp!
-```
+def parse_action(text: str) -> Optional[int]:
+    clean = text.strip().upper()
+    if clean in ACTION_NAME_TO_ID:
+        return ACTION_NAME_TO_ID[clean]
+    for name, idx in ACTION_NAME_TO_ID.items():
+        if re.search(rf"\b{name}\b", clean):
+            return idx
+    return None
 
-Your `openenv.yaml` has proper clamp in graders:
-```yaml
-clamp: [0.001, 0.999]  # ✅ Correct!
-```
 
-## The Real Issue: Edge Cases in Reward Calculation
+def log_start(session_id: str, level: str, model: str):
+    print(f"[START] session_id={session_id} level={level} model={model}", flush=True)
 
-The problem is likely in how `_total_reward` is calculated and clamped. Looking at the code flow:
 
-1. **Perfect episodes**: If an agent completes perfectly, `_total_reward` might equal `_max_reward` exactly → score = 1.0 → **OUT OF RANGE** ❌
-2. **Failed episodes**: If an agent gets 0 reward, score = 0.0 → **OUT OF RANGE** ❌
+def log_step(step_num: int, action_name: str, state: Dict[str, Any]):
+    print(
+        f"[STEP] step={step_num} action={action_name} "
+        f"step_reward={state.get('step_reward', 0.0):.4f} "
+        f"score={state.get('normalised_score', 0.0):.4f}",
+        flush=True,
+    )
 
-### Solution: Ensure Scoring Never Hits Boundaries
 
-The issue is in the normalised_score calculation. Even with clamping, if your raw score calculation produces exactly 0.0 or 1.0, the clamping converts it to 0.001 or 0.999 AFTER it's returned, but the grader might be seeing the intermediate values.
+def log_end(session_id: str, state: Dict[str, Any]):
+    print(
+        f"[END] session_id={session_id} status={state.get('task_status', 'Unknown')} "
+        f"steps={state.get('steps_taken', 0)} "
+        f"final_score={state.get('normalised_score', 0.0):.4f}",
+        flush=True,
+    )
 
-## Recommended Fix
 
-### Fix 1: Update `openenv.yaml` (Cleaner Approach)
+def ensure_server_running(base_url: str):
+    """Start uvicorn server if not already running."""
+    try:
+        r = requests.get(f"{base_url}/healthz", timeout=3)
+        if r.status_code == 200:
+            return
+    except requests.RequestException:
+        pass
 
-The current configuration is correct, but let's make it more explicit:
+    print("[INFO] Starting server...", flush=True)
+    subprocess.Popen(
+        ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860", "--workers", "1"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    for _ in range(20):
+        time.sleep(1)
+        try:
+            r = requests.get(f"{base_url}/healthz", timeout=2)
+            if r.status_code == 200:
+                print("[INFO] Server is up.", flush=True)
+                return
+        except requests.RequestException:
+            continue
+    raise RuntimeError("Server failed to start within 20 seconds")
 
-```yaml
-evaluation:
-  tasks:
-    - id: task_easy
-      reset_body:
-        level: easy
-        seed: 42
-      grader:
-        type: score
-        field: normalised_score
-        aggregation: mean
-        episodes: 10
-        clamp: [0.001, 0.999]  # ✅ Keep this - ensures scores stay in range
 
-    - id: task_medium
-      reset_body:
-        level: medium
-        seed: 42
-      grader:
-        type: score
-        field: normalised_score
-        aggregation: mean
-        episodes: 10
-        clamp: [0.001, 0.999]
+def run_agent(level: str, base_url: str, products=None, seed=None):
+    ensure_server_running(base_url)
 
-    - id: task_hard
-      reset_body:
-        level: hard
-        seed: 42
-      grader:
-        type: score
-        field: normalised_score
-        aggregation: mean
-        episodes: 10
-        clamp: [0.001, 0.999]
-```
+    api_base_url  = os.environ.get("API_BASE_URL", "").strip()
+    model         = os.environ.get("MODEL_NAME", "gpt-4o-mini").strip()
+    hf_token      = os.environ.get("HF_TOKEN", "").strip()
+    effective_key = hf_token if hf_token else "placeholder-key"
 
-### Fix 2: Update `supermart_env.py` (More Defensive)
+    try:
+        client = OpenAI(
+            api_key=effective_key,
+            base_url=api_base_url if api_base_url else None,
+        )
+    except Exception as exc:
+        print(f"[ERROR] Failed to create OpenAI client: {exc}", flush=True)
+        sys.exit(1)
 
-Strengthen the normalised_score method to ensure it never returns exact 0.0 or 1.0:
+    reset_payload: Dict[str, Any] = {"level": level}
+    if products:
+        reset_payload["products"] = products
+    if seed is not None:
+        reset_payload["seed"] = seed
 
-```python
-def normalised_score(self) -> float:
-    raw = max(0.0, self._total_reward)
-    if self._max_reward > 0:
-        score = min(raw / self._max_reward, 1.0)
-    else:
-        score = 0.0
-    
-    # Add small epsilon to avoid exact boundaries
-    score = max(0.0, min(1.0, score))
-    
-    # Ensure strictly between 0 and 1
-    epsilon = 1e-3
-    if score <= 0.0:
-        return epsilon  # 0.001
-    elif score >= 1.0:
-        return 1.0 - epsilon  # 0.999
-    else:
-        return score  # Already in range
-```
+    try:
+        r = requests.post(f"{base_url}/reset", json=reset_payload, timeout=10)
+        r.raise_for_status()
+    except requests.RequestException as exc:
+        print(f"[ERROR] Could not reach server at {base_url}: {exc}", flush=True)
+        sys.exit(1)
 
-### Fix 3: Verify `inference.py` Return Value
+    state      = r.json()
+    session_id = state["session_id"]
+    step_num   = 0
+    conversation: list = []
 
-Ensure the final score returned is ALWAYS in range:
+    log_start(session_id, level, model)
 
-```python
-# At line 200-202, already correct:
-raw_score = state.get("normalised_score", 0.0)
-final_score = max(0.001, min(0.999, raw_score))
-```
+    while (
+        not state.get("terminated", False)
+        and not state.get("truncated", False)
+        and not state.get("done", False)
+        and state.get("task_status") == "In-Progress"
+    ):
+        user_msg = build_user_message(state)
+        conversation.append({"role": "user", "content": user_msg})
+        trimmed_history = conversation[-20:]
 
-This is already correct ✅
+        try:
+            completion = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "system", "content": SYSTEM_PROMPT}] + trimmed_history,
+                max_tokens=10,
+                temperature=0.0,
+            )
+            reply = completion.choices[0].message.content or ""
+        except Exception as exc:
+            print(f"[ERROR] LLM call failed: {exc}", flush=True)
+            break
 
-## Implementation Steps
+        action_id = parse_action(reply)
+        if action_id is None:
+            action_id = 1
 
-### Step 1: Replace `openenv.yaml`
-Copy `openenv_fixed.yaml` to `openenv.yaml` (they're identical in structure, confirming your config is correct)
+        action_name = ACTION_NAMES[action_id]
+        conversation.append({"role": "assistant", "content": action_name})
 
-### Step 2: Update `supermart_env.py` (Recommended)
+        try:
+            r = requests.post(
+                f"{base_url}/step/{session_id}",
+                json={"action": action_id},
+                timeout=10,
+            )
+            r.raise_for_status()
+        except requests.RequestException as exc:
+            print(f"[ERROR] Step request failed: {exc}", flush=True)
+            break
 
-Replace the `normalised_score` method (around line 248) with:
+        state    = r.json()
+        step_num += 1
+        log_step(step_num, action_name, state)
 
-```python
-def normalised_score(self) -> float:
-    """Calculate normalised score, ensuring it's strictly between 0 and 1."""
-    raw = max(0.0, self._total_reward)
-    
-    # Calculate base score
-    if self._max_reward > 0:
-        score = min(raw / self._max_reward, 1.0)
-    else:
-        score = 0.0
-    
-    # Clamp strictly between 0.001 and 0.999
-    epsilon = 0.001
-    return max(epsilon, min(1.0 - epsilon, score))
-```
+    log_end(session_id, state)
 
-### Step 3: Test Locally
+    # Clamp score strictly between 0 and 1 as required by the evaluator
+    raw_score = state.get("normalised_score", 0.0)
+    return max(0.001, min(0.999, raw_score))
 
-Before resubmitting:
-```bash
-# Run a quick test with one episode
-python inference.py --level easy --base-url http://localhost:7860
-```
 
-Verify the final score logged is between 0.001 and 0.999 (not 0.0 or 1.0).
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="LLM agent for SupermarketNav")
+    parser.add_argument("--level", default="easy", choices=["easy", "medium", "hard"])
+    parser.add_argument("--base-url", default=DEFAULT_BASE_URL, dest="base_url")
+    parser.add_argument("--products", nargs="*", help="Optional product names")
+    parser.add_argument("--seed", type=int, default=None)
+    args = parser.parse_args()
 
-### Step 4: Resubmit
+    try:
+        score = run_agent(
+            level=args.level,
+            base_url=args.base_url,
+            products=args.products,
+            seed=args.seed,
+        )
+        print(f"[DONE] score={score:.4f}", flush=True)
+    except Exception as exc:
+        print(f"[FATAL] {exc}", flush=True)
+        sys.exit(1)
 
-Push your changes and resubmit to the hackathon platform.
-
-## Verification Checklist
-
-- [ ] `openenv.yaml` has exactly 3 tasks (easy, medium, hard) ✅
-- [ ] Each task has a grader with `clamp: [0.001, 0.999]` ✅
-- [ ] `normalised_score()` method in `supermart_env.py` clamps output
-- [ ] `inference.py` returns final score in range [0.001, 0.999]
-- [ ] All graders use `type: score` and `field: normalised_score` ✅
-- [ ] No scores are exactly 0.0 or 1.0
-
-## Why This Error Happens
-
-The OpenEnv evaluator is strict about score ranges to prevent:
-- Division by zero in metrics
-- Numerical instability in aggregation
-- Invalid probability distributions (scores must support averaging)
-
-The clamp `[0.001, 0.999]` leaves room for averaging without hitting boundaries.
-
-## Need Help?
-
-If you're still seeing failures after these fixes:
-1. Check the detailed error logs from the platform
-2. Ensure your `normalised_score()` is using the updated code
-3. Verify episodes are actually completing (not timing out)
-4. Check that `_max_reward` is calculated correctly for each difficulty level
+    sys.exit(0)
